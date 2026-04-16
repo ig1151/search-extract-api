@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { searchDuckDuckGo, fetchPage } from '../utils/scraper';
-import type { SearchRequest, SearchResponse, SearchIntent, SearchSource } from '../types/index';
+import type { SearchRequest, SearchResponse, SearchIntent, SearchSource, SearchDecision } from '../types/index';
 
 const client = new Anthropic({ apiKey: config.anthropic.apiKey });
 
@@ -23,10 +23,8 @@ export async function searchAndExtract(req: SearchRequest): Promise<SearchRespon
 
   logger.info({ id, query: req.query, intent }, 'Starting search');
 
-  // Search DuckDuckGo
   const rawResults = await searchDuckDuckGo(req.query, maxResults);
 
-  // Fetch top 3 pages for content
   const pageContents = await Promise.allSettled(
     rawResults.slice(0, 3).map(r => fetchPage(r.url))
   );
@@ -36,7 +34,6 @@ export async function searchAndExtract(req: SearchRequest): Promise<SearchRespon
     .filter(Boolean)
     .join('\n\n---\n\n');
 
-  // Build sources with relevance
   const sources: SearchSource[] = rawResults.map((r, i) => ({
     title: r.title,
     url: r.url,
@@ -44,10 +41,9 @@ export async function searchAndExtract(req: SearchRequest): Promise<SearchRespon
     relevance: Math.max(0.5, 1 - i * 0.1),
   }));
 
-  // Use Claude to extract and structure
   const extractFields = req.extract_fields?.length ? `\nExtract these specific fields: ${req.extract_fields.join(', ')}` : '';
 
-  const prompt = `You are a web research assistant. A user searched for: "${req.query}"
+  const prompt = `You are a web research and decision assistant. A user searched for: "${req.query}"
 
 Intent: ${INTENT_PROMPTS[intent]}${extractFields}
 
@@ -56,19 +52,32 @@ ${pageTexts || rawResults.map(r => `${r.title}: ${r.snippet}`).join('\n')}
 
 Return ONLY valid JSON:
 {
-  "answer": "<comprehensive answer based on the search results>",
+  "answer": "<comprehensive 2-5 sentence answer directly addressing the query>",
+  "decision": "<proceed|caution|avoid|inconclusive>",
+  "confidence": <float 0-1>,
+  "key_points": ["<point 1>", "<point 2>", "<point 3>"],
   "structured_data": {
-    <extract relevant structured data as key-value pairs based on the query and intent>
+    <extract relevant structured data as key-value pairs>
   }
 }
 
+Decision guidelines:
+- "proceed" — evidence strongly supports the query intent (good investment, safe to use, recommended, etc.)
+- "caution" — mixed signals, some concerns worth noting
+- "avoid" — evidence suggests this is risky, problematic or inadvisable
+- "inconclusive" — insufficient data to make a clear recommendation
+
 Rules:
-- answer should be 2-5 sentences, directly addressing the query
-- structured_data should contain the most useful extracted data (lists, numbers, names, dates etc.)
-- Be factual and cite information from the sources only
-- If no good results found, say so honestly`;
+- answer should directly address the query
+- key_points should be 3-5 specific, actionable insights from the sources
+- confidence reflects how certain you are based on source quality and consensus (0.9+ for clear consensus)
+- structured_data should contain the most useful extracted data
+- Be factual and base decisions only on what the sources say`;
 
   let answer = 'No relevant results found for this query.';
+  let decision: SearchDecision = 'inconclusive';
+  let confidence = 0.5;
+  let keyPoints: string[] = [];
   let structuredData: Record<string, unknown> = {};
 
   try {
@@ -81,16 +90,21 @@ Rules:
     const raw = response.content.find(b => b.type === 'text')?.text ?? '{}';
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     answer = parsed.answer ?? answer;
+    decision = (parsed.decision ?? 'inconclusive') as SearchDecision;
+    confidence = Number(parsed.confidence ?? 0.5);
+    keyPoints = (parsed.key_points ?? []) as string[];
     structuredData = parsed.structured_data ?? {};
   } catch (err) {
     logger.warn({ id, err }, 'Claude extraction failed — using snippets');
     answer = rawResults.slice(0, 3).map(r => r.snippet).filter(Boolean).join(' ') || answer;
   }
 
-  logger.info({ id, resultCount: sources.length }, 'Search complete');
+  logger.info({ id, resultCount: sources.length, decision, confidence }, 'Search complete');
 
   return {
-    id, query: req.query, intent, answer, sources, structured_data: structuredData,
+    id, query: req.query, intent, answer,
+    decision, confidence, key_points: keyPoints,
+    sources, structured_data: structuredData,
     latency_ms: Date.now() - t0, created_at: new Date().toISOString(),
   };
 }

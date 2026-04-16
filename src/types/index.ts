@@ -1,4 +1,5 @@
 export type SearchIntent = 'summary' | 'facts' | 'news' | 'research' | 'extract';
+export type SearchDecision = 'proceed' | 'caution' | 'avoid' | 'inconclusive';
 
 export interface SearchRequest {
   query: string;
@@ -19,6 +20,9 @@ export interface SearchResponse {
   query: string;
   intent: SearchIntent;
   answer: string;
+  decision: SearchDecision;
+  confidence: number;
+  key_points: string[];
   sources: SearchSource[];
   structured_data: Record<string, unknown>;
   latency_ms: number;
