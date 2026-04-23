@@ -1,11 +1,10 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { v4 as uuidv4 } from 'uuid';
-import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { searchDuckDuckGo, fetchPage } from '../utils/scraper';
 import type { SearchRequest, SearchResponse, SearchIntent, SearchSource, SearchDecision } from '../types/index';
 
-const client = new Anthropic({ apiKey: config.anthropic.apiKey });
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const MODEL = 'anthropic/claude-sonnet-4-5';
 
 const INTENT_PROMPTS: Record<SearchIntent, string> = {
   summary: 'Provide a concise summary of the key information found.',
@@ -62,7 +61,7 @@ Return ONLY valid JSON:
 }
 
 Decision guidelines:
-- "proceed" — evidence strongly supports the query intent (good investment, safe to use, recommended, etc.)
+- "proceed" — evidence strongly supports the query intent
 - "caution" — mixed signals, some concerns worth noting
 - "avoid" — evidence suggests this is risky, problematic or inadvisable
 - "inconclusive" — insufficient data to make a clear recommendation
@@ -70,7 +69,7 @@ Decision guidelines:
 Rules:
 - answer should directly address the query
 - key_points should be 3-5 specific, actionable insights from the sources
-- confidence reflects how certain you are based on source quality and consensus (0.9+ for clear consensus)
+- confidence reflects how certain you are based on source quality and consensus
 - structured_data should contain the most useful extracted data
 - Be factual and base decisions only on what the sources say`;
 
@@ -81,13 +80,26 @@ Rules:
   let structuredData: Record<string, unknown> = {};
 
   try {
-    const response = await client.messages.create({
-      model: config.anthropic.model,
-      max_tokens: 1024,
-      messages: [{ role: 'user', content: prompt }],
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) throw new Error('OPENROUTER_API_KEY not set');
+
+    const response = await fetch(OPENROUTER_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+      }),
     });
 
-    const raw = response.content.find(b => b.type === 'text')?.text ?? '{}';
+    if (!response.ok) throw new Error(`OpenRouter error: ${response.status}`);
+    const data = await response.json() as { choices: { message: { content: string } }[] };
+    const raw = data.choices[0].message.content ?? '{}';
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     answer = parsed.answer ?? answer;
     decision = (parsed.decision ?? 'inconclusive') as SearchDecision;
@@ -95,7 +107,7 @@ Rules:
     keyPoints = (parsed.key_points ?? []) as string[];
     structuredData = parsed.structured_data ?? {};
   } catch (err) {
-    logger.warn({ id, err }, 'Claude extraction failed — using snippets');
+    logger.warn({ id, err }, 'OpenRouter extraction failed — using snippets');
     answer = rawResults.slice(0, 3).map(r => r.snippet).filter(Boolean).join(' ') || answer;
   }
 
